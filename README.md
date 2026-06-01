@@ -28,6 +28,8 @@ By **Faderaulas** · MIT License.
 - 🎬 **Ambient mode (Ambilight)** — the light follows your screen's dominant color
 - ⌨️ **Global hotkeys** — key combos that work anywhere in Windows, even minimized
 - 🟢 **System tray** — closing the window hides it to the tray; the app keeps running
+- 🔒 **Single instance** — launching the app again just brings the running window to the
+  front (restored from the tray if hidden) instead of opening a second copy
 - 💡 **Default state** — apply a saved state automatically when the bulb is powered back on
 - 🔦 **Multi-bulb** — control several bulbs with a selector; add/edit/remove them in-app
 - 🌙 Modern dark UI, smooth-transition (fade) toggle, remembers its window position
