@@ -1,0 +1,7 @@
+# Runtime dependencies (pinned to tested versions)
+tinytuya==1.18.0
+pystray==0.19.5
+pillow==12.2.0
+
+# For building the standalone .exe (optional):
+#   pip install pyinstaller==6.20.0

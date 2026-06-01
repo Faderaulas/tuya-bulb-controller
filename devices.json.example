@@ -1,0 +1,9 @@
+[
+  {
+    "name": "Living Room",
+    "id": "REPLACE_WITH_YOUR_DEVICE_ID",
+    "ip": "192.168.1.50",
+    "key": "REPLACE_WITH_YOUR_LOCAL_KEY",
+    "version": "3.5"
+  }
+]

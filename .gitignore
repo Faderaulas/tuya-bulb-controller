@@ -1,0 +1,21 @@
+# Local configuration / secrets (NEVER commit — contains the bulb's local key)
+devices.json
+preferences.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Misc
+_icon_tmp.png
+*.log
+.DS_Store
+Thumbs.db
