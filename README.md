@@ -9,6 +9,12 @@ Wi-Fi colour bulbs (Smart Life / Tuya Smart compatible).
 Built with Python + Tkinter + [tinytuya](https://github.com/jasonacox/tinytuya).
 By **Faderaulas** · MIT License.
 
+## Screenshots
+
+| Main window | Color mode |
+| :---: | :---: |
+| ![Main window](screenshots/main.png) | ![Color mode](screenshots/color.png) |
+
 ---
 
 ## Features
