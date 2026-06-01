@@ -1583,6 +1583,44 @@ class App(tk.Tk):
         finally:
             self._syncing = False
 
+    # ---------- single instance ----------
+    def _start_single_instance(self):
+        """Create the named event and a thread that waits for a second instance's
+        signal; when it arrives, bring this window to the front."""
+        if os.name != "nt":
+            return
+        try:
+            k = _config_kernel32()
+            # auto-reset event (goes back to "non-signaled" by itself after release)
+            self._show_event = k.CreateEventW(None, False, False, _INSTANCE_EVENT_NAME)
+            if not self._show_event:
+                return
+
+            def _wait():
+                INFINITE = 0xFFFFFFFF
+                WAIT_OBJECT_0 = 0
+                while True:
+                    if k.WaitForSingleObject(self._show_event, INFINITE) == WAIT_OBJECT_0:
+                        # hop back to the UI thread to touch the window safely
+                        self.after(0, self._show_window)
+                    else:
+                        break
+
+            threading.Thread(target=_wait, daemon=True).start()
+        except Exception:
+            pass
+
+    def _show_window(self):
+        """Restore the window (even from the tray) and raise it to the top."""
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+            self.attributes("-topmost", True)
+            self.after(250, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
     # ---------- system tray / close ----------
     def _create_tray(self):
         img = Image.open(ICON)
@@ -1948,6 +1986,60 @@ class ShortcutsWindow(tk.Toplevel):
         self.destroy()
 
 
+# ---------- single instance (Windows) ----------
+# Make sure only ONE process of the app runs. A second instance detects the
+# first one through a named mutex (a cross-process lock) and, instead of opening
+# another window, signals the first one to come to the front (even from the tray).
+_INSTANCE_MUTEX_NAME = "faderaulas.tuyabulbcontroller.mutex"
+_INSTANCE_EVENT_NAME = "faderaulas.tuyabulbcontroller.show_event"
+_instance_mutex = None   # keep the mutex handle alive for the whole app lifetime
+
+
+def _config_kernel32():
+    """Load kernel32 and declare the argument/return types of the functions used.
+    On 64-bit Windows this is ESSENTIAL: without restype=HANDLE, ctypes assumes a
+    32-bit int and truncates the 64-bit handles -> everything fails silently."""
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    k.CreateMutexW.restype = wintypes.HANDLE
+    k.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+    k.CreateEventW.restype = wintypes.HANDLE
+    k.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    k.OpenEventW.restype = wintypes.HANDLE
+    k.SetEvent.argtypes = [wintypes.HANDLE]
+    k.SetEvent.restype = wintypes.BOOL
+    k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k.WaitForSingleObject.restype = wintypes.DWORD
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+    return k
+
+
+def _another_instance_running():
+    """Return True if another instance is already running (and, in that case,
+    signal the existing instance to bring its window to the front). Outside
+    Windows no lock is applied (returns False = allowed to open)."""
+    if os.name != "nt":
+        return False
+    global _instance_mutex
+    try:
+        k = _config_kernel32()
+        ERROR_ALREADY_EXISTS = 183
+        # CreateMutexW creates the lock if absent; if it already exists it returns
+        # a handle to the same lock and flags ERROR_ALREADY_EXISTS.
+        _instance_mutex = k.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            EVENT_MODIFY_STATE = 0x0002
+            h = k.OpenEventW(EVENT_MODIFY_STATE, False, _INSTANCE_EVENT_NAME)
+            if h:
+                k.SetEvent(h)        # wake the first instance -> it shows itself
+                k.CloseHandle(h)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _set_app_id():
     """On Windows, set a dedicated AppUserModelID so the taskbar uses the window
     icon (instead of the Python one)."""
@@ -1959,8 +2051,12 @@ def _set_app_id():
 
 
 def main():
+    # single instance: if one is already running, bring it to the front and exit
+    if _another_instance_running():
+        return
     _set_app_id()
     app = App()
+    app._start_single_instance()
     # "--tray": start straight into the tray (used for Windows autostart)
     if "--tray" in sys.argv and TRAY_OK and app.bulbs:
         app.after(150, app._on_close)
