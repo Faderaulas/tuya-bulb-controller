@@ -1,0 +1,51 @@
+name: Build and release .exe
+
+# Builds the Windows .exe on GitHub's CI whenever a version tag is pushed,
+# attaches it to the matching release and signs a build-provenance attestation
+# (so anyone can verify the binary came from this exact source).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write        # create/upload the release
+  id-token: write        # required for the build-provenance attestation
+  attestations: write    # required to write the attestation
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies (pinned)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.20.0
+
+      - name: Build the .exe
+        run: >
+          pyinstaller --noconfirm --windowed --onefile
+          --name "Tuya Bulb Controller" --icon icon.ico
+          --add-data "icon.png;." --add-data "icon.ico;."
+          bulb_controller.py
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/Tuya Bulb Controller.exe"
+
+      - name: Publish the binary to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "dist/Tuya Bulb Controller.exe"
+          fail_on_unmatched_files: true

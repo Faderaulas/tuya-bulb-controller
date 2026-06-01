@@ -107,6 +107,23 @@ Run with `--tray` to start minimized in the system tray (handy for Windows start
 
 ---
 
+## Verifying the release binary
+
+The `.exe` attached to each [release](../../releases) is built automatically by
+**GitHub Actions** from the tagged source — you can read the full build logs under
+the [Actions](../../actions) tab — and it ships with a **signed build-provenance
+attestation**. Verify it really came from this repo's CI with the GitHub CLI:
+
+```bash
+gh attestation verify "Tuya Bulb Controller.exe" --repo Faderaulas/tuya-bulb-controller
+```
+
+The whole source is open (MIT), so the simplest trustless option is always to
+**build the `.exe` yourself** from the source (see the section above) instead of
+downloading it.
+
+---
+
 ## Configuration files (created at runtime, not committed)
 
 - **`devices.json`** — your bulbs (`id`, `ip`, `key`, `version`). Contains the local
