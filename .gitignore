@@ -1,4 +1,7 @@
 # Local configuration / secrets (NEVER commit — contains the bulb's local key)
+dispositivos.json
+preferencias.json
+# legacy English names (kept ignored so an old local file is never committed)
 devices.json
 preferences.json
 

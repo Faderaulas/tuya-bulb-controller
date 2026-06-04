@@ -37,7 +37,7 @@ jobs:
           pyinstaller --noconfirm --windowed --onefile
           --name "Tuya Bulb Controller" --icon icon.ico
           --add-data "icon.png;." --add-data "icon.ico;."
-          bulb_controller.py
+          controlador_lampada.py
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2

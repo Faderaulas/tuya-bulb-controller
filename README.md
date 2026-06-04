@@ -9,6 +9,10 @@ Wi-Fi colour bulbs (Smart Life / Tuya Smart compatible).
 Built with Python + Tkinter + [tinytuya](https://github.com/jasonacox/tinytuya).
 By **Faderaulas** · MIT License.
 
+> 🌐 **Bilingual (English / Portuguese).** Switch the interface language in
+> **⚙ Bulbs → Language**; it applies after a restart. The code identifiers are in
+> Portuguese (the project grew PT-first), but the whole UI is fully translated.
+
 ## Screenshots
 
 | Main window | Color mode |
@@ -32,6 +36,10 @@ By **Faderaulas** · MIT License.
   front (restored from the tray if hidden) instead of opening a second copy
 - 💡 **Default state** — apply a saved state automatically when the bulb is powered back on
 - 🔦 **Multi-bulb** — control several bulbs with a selector; add/edit/remove them in-app
+- 🌐 **Bilingual UI** — English / Portuguese, switchable in-app (applies on restart)
+- 📡 **Auto-rediscovery** — if a bulb's IP changes (DHCP gives it a new address after
+  it was off for a while), the app finds it again on the LAN by device ID and updates
+  itself, instead of being stuck "offline"
 - 🌙 Modern dark UI, smooth-transition (fade) toggle, remembers its window position
 
 Everything runs **locally over the LAN** — the only cloud step is a one-time
@@ -69,26 +77,26 @@ Tuya bulbs are controlled locally with a per-device **local key**. To obtain it:
 4. Run the helper (you type the credentials locally — nothing is uploaded or stored):
 
 ```bash
-.venv\Scripts\python.exe get_local_key.py
+.venv\Scripts\python.exe obter_chave.py
 ```
 
-It writes a **`devices.json`** with each bulb's `id`, `ip`, `key` and `version`.
+It writes a **`dispositivos.json`** with each bulb's `id`, `ip`, `key` and `version`.
 
 > Note: OEM-branded apps (like Intelbras Izy Smart) usually can't be linked to the
 > Tuya developer console. If so, re-pair the bulb in the official **Smart Life** app
 > and link that account instead.
 
-Alternatively, copy `devices.json.example` to `devices.json` and fill it in by hand,
+Alternatively, copy `dispositivos.json.example` to `dispositivos.json` and fill it in by hand,
 or use the in-app **⚙ Bulbs → Scan network** button to discover IP/version
 (you still need the local key from the step above).
 
 ### 3. Run
 
 ```bash
-.venv\Scripts\pythonw.exe bulb_controller.py
+.venv\Scripts\pythonw.exe controlador_lampada.py
 ```
 
-(or `python bulb_controller.py` to keep a console for debugging).
+(or `python controlador_lampada.py` to keep a console for debugging).
 
 ---
 
@@ -98,10 +106,10 @@ or use the in-app **⚙ Bulbs → Scan network** button to discover IP/version
 .venv\Scripts\python.exe -m pip install pyinstaller
 .venv\Scripts\python.exe -m PyInstaller --noconfirm --windowed --onefile ^
   --name "Tuya Bulb Controller" --icon icon.ico ^
-  --add-data "icon.png;." --add-data "icon.ico;." bulb_controller.py
+  --add-data "icon.png;." --add-data "icon.ico;." controlador_lampada.py
 ```
 
-The result is in `dist/`. Put a `devices.json` next to the `.exe`.
+The result is in `dist/`. Put a `dispositivos.json` next to the `.exe`.
 Run with `--tray` to start minimized in the system tray (handy for Windows startup).
 
 > Rebuild tip: close the running `.exe` first (otherwise the file is locked).
@@ -128,9 +136,9 @@ downloading it.
 
 ## Configuration files (created at runtime, not committed)
 
-- **`devices.json`** — your bulbs (`id`, `ip`, `key`, `version`). Contains the local
+- **`dispositivos.json`** — your bulbs (`id`, `ip`, `key`, `version`). Contains the local
   key, so it's **gitignored**. Each user/device has its own.
-- **`preferences.json`** — favorites, default state, day/night, shortcuts, window position.
+- **`preferencias.json`** — favorites, default state, day/night, shortcuts, window position.
 
 ---
 
@@ -139,7 +147,7 @@ downloading it.
 - The bulb keeps working in the Smart Life app at the same time as this app — they
   stay in sync.
 - The **local key changes** whenever you re-pair the bulb in an app — re-run
-  `get_local_key.py` if that happens.
+  `obter_chave.py` if that happens.
 - Ambient mode samples the screen at ~3 fps (downscaled) — very light on the CPU.
 
 ---
