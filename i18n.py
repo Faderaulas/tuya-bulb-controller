@@ -126,6 +126,7 @@ TEXTOS = {
         # --- estados do botao de power ---
         "btn_ligada": "LIGADA",
         "btn_desligada": "DESLIGADA",
+        "btn_offline": "SEM CONEXÃO",
 
         # --- timer/label ---
         "timer_vazio": "—",
@@ -324,6 +325,7 @@ TEXTOS = {
 
         "btn_ligada": "ON",
         "btn_desligada": "OFF",
+        "btn_offline": "OFFLINE",
 
         "timer_vazio": "—",
         "timer_contagem": "⏱ {m:02d}:{s:02d}",

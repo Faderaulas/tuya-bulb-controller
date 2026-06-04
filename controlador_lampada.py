@@ -1114,13 +1114,19 @@ class App(tk.Tk):
             for i, lmp in enumerate(self.lampadas):
                 # sem 'command': o clique/arrasto e tratado por _tornar_aba
                 # (clique = selecionar; arrastar de lado = reordenar as lampadas)
-                b = RoundedButton(tabs, text=lmp.get("name", T("lampada_numerada", n=i + 1)),
+                offline = self._online_lamp.get(lmp.get("id")) is False
+                rotulo = lmp.get("name", T("lampada_numerada", n=i + 1))
+                if offline:
+                    rotulo = "⚠ " + rotulo   # marca a lampada que caiu da rede
+                b = RoundedButton(tabs, text=rotulo,
                                   width=96, height=26, radius=9)
                 b.pack(side="left", padx=(0, 4))
                 self._tab_btns.append(b)
                 self._tornar_aba(b, i)
                 if i == self.idx:
                     b.set_colors(ACCENT, ACCENT_HOVER, ACCENT_ACTIVE)
+                elif offline:
+                    b.set_colors(OFF, OFF_HOVER, OFF_ACTIVE)
         RoundedButton(self.sel_frame, text=T("btn_lampadas_engrenagem"), width=108, height=26, radius=9,
                       command=self._abrir_config).pack(side="right")
 
@@ -2264,9 +2270,9 @@ class App(tk.Tk):
         transicao offline->online e REAPLICAVA o estado padrao (bug do 'voltou pra 44')."""
         if cid is None:
             return
+        anterior = self._online_lamp.get(cid)
         if online:
             self._falhas_online[cid] = 0
-            anterior = self._online_lamp.get(cid)
             self._online_lamp[cid] = True
             # so reaplica o padrao se a PROPRIA lampada selecionada acabou de voltar
             if anterior is False and cid == self._id_ativo():
@@ -2277,15 +2283,26 @@ class App(tk.Tk):
             self._falhas_online[cid] = n
             if n >= 2:
                 self._online_lamp[cid] = False
+        # se o online/offline mudou de fato, repinta o seletor (aba marca '⚠ ' offline)
+        if self._online_lamp.get(cid) is not anterior and len(self.lampadas) > 1:
+            self._montar_seletor()
         self._atualizar_aviso_online()
 
     def _atualizar_aviso_online(self):
-        """Mostra/esconde o aviso de offline conforme a lampada selecionada."""
+        """Mostra/esconde o aviso de offline conforme a lampada selecionada E
+        reflete isso no botao de power. Sem isto o botao continuava mostrando
+        'LIGADA' numa lampada que nao responde -- era o engano do 'aparece
+        ligada mas nao esta' (lampada caiu da Wi-Fi / fora da rede)."""
         if self._online_lamp.get(self._id_ativo()) is False:
             self.lbl_aviso.config(text=T("aviso_offline"))
             self.lbl_aviso.pack(fill="x", pady=(8, 0))
+            # botao nao afirma ligada/desligada: vira "SEM CONEXAO" em cinza
+            self.btn_power.set_text(T("btn_offline"))
+            self.btn_power.set_colors(OFF, OFF_HOVER, OFF_ACTIVE)
         else:
             self.lbl_aviso.pack_forget()
+            # de volta online: botao volta a refletir o estado real conhecido
+            self._refletir_power(bool(self.var_power.get()))
 
     def _ao_ligar_lampada(self):
         """Quando a lampada volta do offline (interruptor religado): aplica o
