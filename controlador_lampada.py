@@ -1013,6 +1013,7 @@ class App(tk.Tk):
         self.ctrl = self.controladores[0] if self.controladores else _CtrlVazio()
         self._online_lamp = {}       # id da lampada -> online? (None = ainda desconhecido)
         self._falhas_online = {}     # id -> leituras ruins seguidas (debounce do offline)
+        self._power_ao_offline = {}  # id -> power no momento em que foi marcada offline
 
         self._debounce_brilho = None
         self._debounce_temp = None
@@ -1278,7 +1279,7 @@ class App(tk.Tk):
             c.on_ip = self._ip_redescoberto
         # descarta estado (cena/online) de lampadas que nao existem mais
         ids = {l.get("id") for l in self.lampadas}
-        for d in (self._cenas_ativas, self._online_lamp, self._falhas_online):
+        for d in (self._cenas_ativas, self._online_lamp, self._falhas_online, self._power_ao_offline):
             for k in [k for k in d if k not in ids]:
                 del d[k]
         # preserva a lampada selecionada se ela ainda existir
@@ -2283,6 +2284,11 @@ class App(tk.Tk):
             self._falhas_online[cid] = n
             if n >= 2:
                 self._online_lamp[cid] = False
+                # grava se a lampada estava ligada ou nao ao cair — distingue blip de rede
+                # (estava ligada) de desligamento real no interruptor (estava ligada mas
+                # agora voltara desligada); so sabemos o power da lampada ativa via var_power
+                if cid == self._id_ativo():
+                    self._power_ao_offline[cid] = self.var_power.get()
         # se o online/offline mudou de fato, repinta o seletor (aba marca '⚠ ' offline)
         if self._online_lamp.get(cid) is not anterior and len(self.lampadas) > 1:
             self._montar_seletor()
@@ -2306,8 +2312,14 @@ class App(tk.Tk):
 
     def _ao_ligar_lampada(self):
         """Quando a lampada volta do offline (interruptor religado): aplica o
-        perfil dia/noite, se ativo, ou o estado padrao (se configurado)."""
+        perfil dia/noite, se ativo, ou o estado padrao (se configurado).
+        Se a lampada estava LIGADA quando caiu, e um blip de rede — nao aplica."""
         if not self.controladores:
+            return
+        cid = self._id_ativo()
+        power_antes = self._power_ao_offline.pop(cid, None)
+        # blip de rede: lamp estava ligada e voltou ligada — nao sobrescreve estado do usuario
+        if power_antes is True:
             return
         if (self.prefs.get("dia_noite") or {}).get("ativo"):
             self._dn_periodo = None
