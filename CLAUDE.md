@@ -43,6 +43,8 @@ assinado. O `i18n.py` é importado estaticamente, então o PyInstaller o empacot
 (não precisa `--add-data`).
 
 Rebuild do `.exe`: feche o `.exe` em execução antes (o arquivo onefile fica travado).
+**Após qualquer ajuste no código, recompilar o `.exe` com o comando acima — o João usa o
+`.exe` em `dist\`, não o script direto.**
 
 ## Arquitetura
 
@@ -59,8 +61,10 @@ Toda a aplicação está em `controlador_lampada.py`. As peças que exigem ler v
 
 - **Estado por lâmpada (id).** Vários estados são rastreados por `id` da lâmpada, não globalmente:
   `_cenas_ativas` (cena destacada), `_online_lamp`/`_falhas_online` (online + debounce de 2 falhas
-  para filtrar blip de rede). Usar uma flag **global** aqui foi o bug do "voltou pra 44" — uma
-  falsa transição offline→online reaplicava o estado padrão.
+  para filtrar blip de rede), `_power_ao_offline` (power no momento em que caiu),
+  `_offline_desde` (timestamp `time.monotonic()` de quando foi marcada offline). Usar uma flag
+  **global** aqui foi o bug do "voltou pra 44" — uma falsa transição offline→online reaplicava o
+  estado padrão.
 
 - **Disponibilidade, reconexão e redescoberta de IP (a parte sensível).** `on_online`/`_set_online`
   detectam a lâmpada caindo (desligada na parede) e voltando. Quando a worker vê a lâmpada
@@ -76,7 +80,10 @@ Toda a aplicação está em `controlador_lampada.py`. As peças que exigem ler v
 
   Quando a lâmpada **volta** online, `_ao_ligar_lampada` aplica o perfil dia/noite (se ativo) ou o
   estado padrão (se `aplicar_ao_abrir`). O padrão **não** é aplicado na abertura do app — só nessa
-  transição offline→online.
+  transição offline→online. Proteção contra blip de rede: se a lâmpada estava ligada ao cair
+  (`_power_ao_offline`) **e** ficou offline por menos de 20s após ser detectada (`_offline_desde`),
+  a reaplicação é suprimida (blip curto não deve sobrescrever o estado do usuário). Desligamento
+  real pelo interruptor dura muito mais — ultrapassa o limiar e o padrão é aplicado normalmente.
 
 - **Conversão de brilho (gotcha — não "consertar" de volta).** O tinytuya ESCREVE brilho como
   `value_max * pct // 100` (escala 0..1000, sem offset). Logo a LEITURA tem que ser

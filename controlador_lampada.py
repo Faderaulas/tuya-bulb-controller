@@ -1014,6 +1014,7 @@ class App(tk.Tk):
         self._online_lamp = {}       # id da lampada -> online? (None = ainda desconhecido)
         self._falhas_online = {}     # id -> leituras ruins seguidas (debounce do offline)
         self._power_ao_offline = {}  # id -> power no momento em que foi marcada offline
+        self._offline_desde = {}     # id -> time.monotonic() de quando foi marcada offline
 
         self._debounce_brilho = None
         self._debounce_temp = None
@@ -1279,7 +1280,7 @@ class App(tk.Tk):
             c.on_ip = self._ip_redescoberto
         # descarta estado (cena/online) de lampadas que nao existem mais
         ids = {l.get("id") for l in self.lampadas}
-        for d in (self._cenas_ativas, self._online_lamp, self._falhas_online, self._power_ao_offline):
+        for d in (self._cenas_ativas, self._online_lamp, self._falhas_online, self._power_ao_offline, self._offline_desde):
             for k in [k for k in d if k not in ids]:
                 del d[k]
         # preserva a lampada selecionada se ela ainda existir
@@ -2284,6 +2285,7 @@ class App(tk.Tk):
             self._falhas_online[cid] = n
             if n >= 2:
                 self._online_lamp[cid] = False
+                self._offline_desde[cid] = time.monotonic()
                 # grava se a lampada estava ligada ou nao ao cair — distingue blip de rede
                 # (estava ligada) de desligamento real no interruptor (estava ligada mas
                 # agora voltara desligada); so sabemos o power da lampada ativa via var_power
@@ -2318,8 +2320,10 @@ class App(tk.Tk):
             return
         cid = self._id_ativo()
         power_antes = self._power_ao_offline.pop(cid, None)
-        # blip de rede: lamp estava ligada e voltou ligada — nao sobrescreve estado do usuario
-        if power_antes is True:
+        offline_duracao = time.monotonic() - self._offline_desde.pop(cid, time.monotonic())
+        # blip de rede: lamp estava ligada E voltou rapido (< 20s offline apos deteccao).
+        # Desligamento real pelo interruptor leva muito mais tempo — nao bloqueia o padrao.
+        if power_antes is True and offline_duracao < 20:
             return
         if (self.prefs.get("dia_noite") or {}).get("ativo"):
             self._dn_periodo = None
