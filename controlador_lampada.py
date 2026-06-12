@@ -424,7 +424,9 @@ class Controlador:
         broadcast na LAN procurando o ID desta lampada e, se ela aparecer noutro IP,
         atualizamos e reconectamos. E a correcao 'de uma vez por todas'.
 
-        Roda na worker (pode bloquear ~6s) com cooldown p/ nao escanear a cada poll."""
+        O scan (~6s) roda numa daemon thread para nao bloquear a fila de comandos:
+        sem isso, comandos do usuario (ligar/desligar) ficavam presos aguardando o
+        broadcast terminar a cada 15s de cooldown."""
         agora = time.monotonic()
         if agora - self._ultimo_scan < 15:
             return
@@ -432,6 +434,11 @@ class Controlador:
         cid = self.cfg.get("id")
         if not cid:
             return
+        threading.Thread(target=self._scan_ip_bg, args=(cid,), daemon=True).start()
+
+    def _scan_ip_bg(self, cid):
+        """Roda numa daemon thread (chamada por _redescobrir_ip). Faz o broadcast
+        UDP sem bloquear a worker; atualiza cfg e forca reconexao se o IP mudou."""
         try:
             with Controlador._scan_lock:
                 info = tinytuya.find_device(dev_id=cid)
@@ -2284,13 +2291,16 @@ class App(tk.Tk):
             n = self._falhas_online.get(cid, 0) + 1
             self._falhas_online[cid] = n
             if n >= 2:
+                # _offline_desde e _power_ao_offline so sao gravados uma vez, na
+                # transicao online->offline (anterior is not False). Se atualizarmos
+                # a cada poll falho (n>=2), offline_duracao sera sempre ~7s quando a
+                # lampada voltar, ativando o anti-blip e impedindo a reaplicacao do
+                # estado padrao mesmo depois de horas desligada.
+                if anterior is not False:
+                    self._offline_desde[cid] = time.monotonic()
+                    if cid == self._id_ativo():
+                        self._power_ao_offline[cid] = self.var_power.get()
                 self._online_lamp[cid] = False
-                self._offline_desde[cid] = time.monotonic()
-                # grava se a lampada estava ligada ou nao ao cair — distingue blip de rede
-                # (estava ligada) de desligamento real no interruptor (estava ligada mas
-                # agora voltara desligada); so sabemos o power da lampada ativa via var_power
-                if cid == self._id_ativo():
-                    self._power_ao_offline[cid] = self.var_power.get()
         # se o online/offline mudou de fato, repinta o seletor (aba marca '⚠ ' offline)
         if self._online_lamp.get(cid) is not anterior and len(self.lampadas) > 1:
             self._montar_seletor()
