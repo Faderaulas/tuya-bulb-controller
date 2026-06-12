@@ -1022,6 +1022,7 @@ class App(tk.Tk):
         self._falhas_online = {}     # id -> leituras ruins seguidas (debounce do offline)
         self._power_ao_offline = {}  # id -> power no momento em que foi marcada offline
         self._offline_desde = {}     # id -> time.monotonic() de quando foi marcada offline
+        self._cache_status = {}      # id -> ultimo dps recebido (exibe ao trocar de aba sem esperar poll)
 
         self._debounce_brilho = None
         self._debounce_temp = None
@@ -1069,7 +1070,7 @@ class App(tk.Tk):
                 pass
 
         if self.lampadas:
-            self.after(300, self.ctrl.pedir_status)
+            self.after(300, lambda: [c.pedir_status() for c in self.controladores])
             # NAO aplica o padrao ao abrir o app (preserva o estado atual da luz);
             # o padrao so entra quando a lampada volta do offline (interruptor religado).
         else:
@@ -1106,12 +1107,15 @@ class App(tk.Tk):
         return None
 
     def _bind_display(self, ctrl):
-        """Direciona os callbacks de status/conexao para o controlador exibido."""
+        """Direciona os callbacks de status/conexao para o controlador exibido.
+        on_status e on_online ficam ativos em TODAS as lampadas (cache de estado +
+        rastreamento de disponibilidade para exibir '⚠' na aba certa); so
+        on_conexao fica exclusivo da lampada ativa (mensagem na status bar)."""
         for c in self.controladores:
-            c.on_status = c.on_conexao = c.on_online = None
-        ctrl.on_status = self._status_recebido
+            c.on_status = self._status_recebido   # _aplicar_status ja filtra por cid ativo
+            c.on_conexao = None
+            c.on_online = self._online_mudou       # rastreia offline de qualquer lampada
         ctrl.on_conexao = self._conexao_mudou
-        ctrl.on_online = self._online_mudou
 
     def _montar_seletor(self):
         for w in self.sel_frame.winfo_children():
@@ -1255,6 +1259,10 @@ class App(tk.Tk):
         self._refletir_cena_ativa()      # destaca a cena (se houver) da nova lampada
         self._atualizar_aviso_online()   # aviso offline reflete a nova lampada
         self._status(T("status_lampada_atual", nome=self._nome_ativo()))
+        # exibe o cache do ultimo poll imediatamente, sem esperar 7s pelo proximo
+        cid = self._id_ativo()
+        if cid in self._cache_status:
+            self._aplicar_status(cid, self._cache_status[cid])
         self.ctrl.pedir_status()
 
     def _parar_efeitos_ativos(self, parar_cena=True):
@@ -1287,7 +1295,7 @@ class App(tk.Tk):
             c.on_ip = self._ip_redescoberto
         # descarta estado (cena/online) de lampadas que nao existem mais
         ids = {l.get("id") for l in self.lampadas}
-        for d in (self._cenas_ativas, self._online_lamp, self._falhas_online, self._power_ao_offline, self._offline_desde):
+        for d in (self._cenas_ativas, self._online_lamp, self._falhas_online, self._power_ao_offline, self._offline_desde, self._cache_status):
             for k in [k for k in d if k not in ids]:
                 del d[k]
         # preserva a lampada selecionada se ela ainda existir
@@ -1299,7 +1307,8 @@ class App(tk.Tk):
         self._montar_seletor()
         self._montar_cenas()
         if self.controladores:
-            self.ctrl.pedir_status()
+            for c in self.controladores:
+                c.pedir_status()
             self._status(T("status_config_atualizada"), OK)
         else:
             self._status(T("status_nenhuma_lampada_config"), AMBER)
@@ -2245,6 +2254,7 @@ class App(tk.Tk):
 
     # ---------- callbacks do controlador (rodam na thread worker) ----------
     def _status_recebido(self, cid, dps):
+        self._cache_status[cid] = dps   # guarda p/ exibir imediatamente ao trocar de aba
         self.after(0, lambda: self._aplicar_status(cid, dps))
 
     def _conexao_mudou(self, ok, msg):
@@ -2342,8 +2352,8 @@ class App(tk.Tk):
             self._aplicar_estado(self.prefs["padrao"], T("status_padrao_aplicado"))
 
     def _poll_status(self):
-        if self.controladores:
-            self.ctrl.pedir_status()
+        for c in self.controladores:
+            c.pedir_status()
         self.after(7000, self._poll_status)
 
     def _aplicar_status(self, cid, dps):
