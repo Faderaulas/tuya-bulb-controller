@@ -1030,6 +1030,7 @@ class App(tk.Tk):
         self._cor_h = 0.0            # matiz atual (0..1) escolhido no anel
         self._sincronizando = False  # evita disparar comandos ao refletir status
         self._mute_ate = 0.0         # ignora polls por alguns seg apos uma acao do usuario
+        self._intencao_cmd = None    # estado que o PC quer aplicar (reafirmar vs nuvem Tuya)
         self.prefs = carregar_prefs()
         definir_idioma(self.prefs.get("idioma", "pt"))
         self._fade = bool(self.prefs.get("fade"))
@@ -1510,6 +1511,48 @@ class App(tk.Tk):
         """Apos uma acao do usuario, ignora o poll por alguns segundos para a
         leitura periodica nao 'voltar' o menu/sliders ao estado anterior."""
         self._mute_ate = time.monotonic() + 3.0
+        modo = self.var_modo.get()
+        brilho = int(self.var_brilho.get())
+        if modo == "colour":
+            h = self._cor_h
+            s = max(0.0, min(1.0, int(self.var_sat.get()) / 100.0))
+            v = max(0.01, min(1.0, brilho / 100.0))
+            cor = tuple(int(c * 255) for c in colorsys.hsv_to_rgb(h, s, v))
+        else:
+            cor = None
+        self._intencao_cmd = {
+            "ts": time.monotonic(),
+            "modo": modo,
+            "brilho": brilho,
+            "temp": int(self.var_temp.get()),
+            "sat": int(self.var_sat.get()),
+            "cor": cor,
+        }
+
+    def _conflito_detectado(self, dps):
+        """Retorna True se os DPS recebidos divergem do estado intencionado pelo PC."""
+        intent = self._intencao_cmd
+        if not intent:
+            return False
+        modo = intent["modo"]
+        if DP_MODE in dps:
+            if (dps[DP_MODE] == "colour") != (modo == "colour"):
+                return True
+        if modo == "white":
+            if DP_BRIGHT in dps:
+                if abs(brilho_para_pct(dps[DP_BRIGHT]) - intent["brilho"]) > 2:
+                    return True
+            if DP_TEMP in dps:
+                pct = round(int(dps[DP_TEMP]) / 1000 * 100)
+                if abs(pct - intent["temp"]) > 2:
+                    return True
+        elif modo == "colour" and dps.get(DP_COLOUR):
+            _, s, v = parse_hsv_componentes(dps[DP_COLOUR])
+            if abs(round(v * 100) - intent["brilho"]) > 2:
+                return True
+            if abs(round(s * 100) - intent["sat"]) > 2:
+                return True
+        return False
 
     def _status(self, msg, cor=MUTED):
         self.lbl_status.config(text=msg, fg=cor)
@@ -1830,8 +1873,12 @@ class App(tk.Tk):
         return est
 
     def _salvar_padrao(self):
-        self.prefs["padrao"] = self._estado_atual()
+        est = self._estado_atual()
+        self.prefs["padrao"] = est
         salvar_prefs(self.prefs)
+        # Envia o estado à lâmpada agora para que a memória interna dela coincida
+        # com o padrão. Sem o app rodando, a lâmpada vai religar neste estado.
+        self._aplicar_estado(est)
         self._status(T("status_padrao_salvo"), OK)
 
     def _aplicar_estado(self, est, msg=None, todas=False):
@@ -2295,7 +2342,7 @@ class App(tk.Tk):
             self._online_lamp[cid] = True
             # so reaplica o padrao se a PROPRIA lampada selecionada acabou de voltar
             if anterior is False and cid == self._id_ativo():
-                self.after(800, self._ao_ligar_lampada)
+                self.after(300, self._ao_ligar_lampada)
         else:
             # exige 2 leituras ruins seguidas p/ marcar offline (filtra blip de 1 poll)
             n = self._falhas_online.get(cid, 0) + 1
@@ -2354,13 +2401,31 @@ class App(tk.Tk):
     def _poll_status(self):
         for c in self.controladores:
             c.pedir_status()
-        self.after(7000, self._poll_status)
+        # Poll mais rapido quando ha lampada offline: a lampada pode ter voltado
+        # entre um poll e outro; 5s casa com o socket timeout (nao adianta ir abaixo).
+        alguma_offline = any(
+            self._online_lamp.get(l.get("id")) is False
+            for l in self.lampadas
+        )
+        self.after(5000 if alguma_offline else 7000, self._poll_status)
 
     def _aplicar_status(self, cid, dps):
         if cid != self._id_ativo():
             return   # status de outra lampada (corrida ao trocar de aba): ignora
-        if time.monotonic() < self._mute_ate:
+        agora = time.monotonic()
+        if agora < self._mute_ate:
             return   # acao recente do usuario: nao deixa o poll sobrescrever a UI
+        # Reafirmacao de intencao: se o poll trouxe um valor diferente do que o PC
+        # comandou nos ultimos 15s (conflito com a nuvem Tuya), reenvia o comando
+        # do PC em vez de aceitar o estado externo.
+        if (self._intencao_cmd is not None
+                and agora - self._intencao_cmd["ts"] < 15.0
+                and self._conflito_detectado(dps)):
+            self._mute_ate = agora + 3.0
+            self.ctrl.aplicar_func(construir_func_estado(self._intencao_cmd))
+            return
+        if self._intencao_cmd and agora - self._intencao_cmd["ts"] >= 15.0:
+            self._intencao_cmd = None
         self._sincronizando = True
         try:
             if DP_POWER in dps:

@@ -42,9 +42,10 @@ Não há testes nem lint — é um único script (`controlador_lampada.py`, ~220
 assinado. O `i18n.py` é importado estaticamente, então o PyInstaller o empacota sozinho
 (não precisa `--add-data`).
 
-Rebuild do `.exe`: feche o `.exe` em execução antes (o arquivo onefile fica travado).
-**Após qualquer ajuste no código, recompilar o `.exe` com o comando acima — o João usa o
-`.exe` em `dist\`, não o script direto.**
+**REGRA OBRIGATÓRIA: após qualquer mudança no código, recompilar o `.exe` imediatamente
+com o comando acima. O João usa o `.exe` em `dist\`, não o script direto. Nunca reportar
+uma tarefa como concluída sem ter recompilado.**
+Feche o `.exe` em execução antes de recompilar (o arquivo onefile fica travado).
 
 ## Arquitetura
 
