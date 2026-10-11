@@ -42,6 +42,21 @@ Não há testes nem lint — é um único script (`controlador_lampada.py`, ~320
 assinado. O `i18n.py` é importado estaticamente, então o PyInstaller o empacota sozinho
 (não precisa `--add-data`).
 
+**Testar sem hardware (não está no repo — recriar quando precisar).** Dá para exercitar a
+worker e a UI com uma lâmpada simulada: uma subclasse de `tinytuya.BulbDevice` que troca só o
+transporte — `_get_socket` (espera `connection_timeout` e devolve `ERR_OFFLINE` se a lâmpada
+simulada está "desligada" ou noutro IP) e `_send_receive` (lê `payload.cmd`/`payload.payload`,
+aplica os DPs num dict e responde; chamar `self._cache_response(resp)`). O resto do `BulbDevice`
+(detecção de tipo, cache, quais DPs enviar) continua real. Substituir também
+`tinytuya.scanner.devices` por um scan falso, atribuir `tinytuya.BulbDevice = Falso` e só então
+importar `controlador_lampada`. Para a `App`: trocar `carregar_lampadas`/`carregar_prefs`,
+anular `salvar_prefs`/`salvar_lampadas`, `TRAY_OK = HOTKEYS_OK = False` e
+`App._iniciar_instancia_unica` — assim nada toca nos arquivos reais. Foi assim que as correções
+de 11/10/2026 foram validadas (pendências de teste real no `ROADMAP.md`).
+
+**O `.venv` deve conter só o `requirements.txt` + PyInstaller.** Pacote extra pode ser embutido
+no `.exe` sem o app usar (o `numpy` entrava via Pillow).
+
 **REGRA OBRIGATÓRIA: após qualquer mudança no código, recompilar o `.exe` imediatamente
 com o comando acima. O João usa o `.exe` em `dist\`, não o script direto. Nunca reportar
 uma tarefa como concluída sem ter recompilado.**
