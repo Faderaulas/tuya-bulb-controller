@@ -24,6 +24,7 @@ import tkinter as tk
 from tkinter import colorchooser, messagebox, simpledialog
 
 import tinytuya
+from tinytuya import scanner as tuya_scanner
 from i18n import T, definir_idioma
 
 try:                       # bandeja + captura de tela (opcional; vem embutido no .exe)
@@ -58,6 +59,24 @@ DP_COLOUR = "24"      # HSV hex: HHHH SSSS VVVV
 
 BRILHO_MIN = 10
 BRILHO_MAX = 1000
+
+# Tempos (em segundos) da conversa com a lampada
+TIMEOUT_SOCKET = 3     # conectar / esperar resposta. Na LAN a lampada responde em ms; um IP
+                       # morto so "falha" no timeout cheio, e enquanto isso a fila fica parada
+SCAN_SEG = 5           # duracao de cada busca por broadcast na LAN (redescoberta de IP)
+RETOMAR_CMD_SEG = 15   # comando que falhou e' reenviado se a lampada voltar dentro desse prazo
+
+# Comandos em que so o pedido MAIS RECENTE interessa. Se a worker esta ocupada (lampada
+# lenta ou offline) e chegam varios do mesmo tipo, os antigos sao pulados em vez de
+# executados um a um -- senao a fila cresce e o que o usuario pediu agora espera atras.
+SO_O_ULTIMO = frozenset(("status", "brilho", "brilho_direto", "temp",
+                         "cor", "cor_direto", "hsv"))
+
+# Erros do tinytuya que significam "nao consegui falar com a lampada" (rede/conexao).
+# Os demais (ex.: 907 = a lampada nao tem aquele recurso) nao sao queda de conexao.
+# O 900 entra porque e o que o tinytuya devolve quando tenta ler o estado antes de
+# gravar (brilho) e a leitura falha.
+ERROS_DE_CONEXAO = frozenset(("900", "901", "902", "904", "905", "914"))
 
 # Cores de presets (chave i18n -> RGB). A chave e' um ID estavel; o rotulo
 # exibido vem de T(chave).
@@ -332,6 +351,30 @@ def salvar_prefs(p):
         pass
 
 
+class FalhaLampada(Exception):
+    """A lampada nao respondeu a um comando. 'reenviar' indica que a conexao caiu no
+    meio da conversa (vale tentar de novo na hora, numa conexao nova)."""
+
+    def __init__(self, msg, reenviar=False):
+        super().__init__(msg)
+        self.reenviar = reenviar
+
+
+def checar_resposta(r, sem_espera=False):
+    """O tinytuya NAO levanta excecao quando a lampada nao responde: devolve um dict
+    {"Error": ..., "Err": codigo}. Sem olhar isso o comando se perdia em silencio (a UI
+    mostrava o estado novo e a lampada continuava no antigo). Aqui a falha de conexao
+    vira excecao, que a worker trata (reconecta e guarda o comando p/ reenviar).
+
+    sem_espera=True: resposta de um envio com nowait (degraus do fade). Ali o 900 so
+    quer dizer "nao ha estado em cache p/ consultar", nao que a lampada caiu."""
+    cod = str(r.get("Err")) if isinstance(r, dict) else ""
+    if cod in ERROS_DE_CONEXAO and not (sem_espera and cod == "900"):
+        # 904 = a lampada fechou a conexao no meio; os outros = nem deu p/ conectar
+        raise FalhaLampada(str(r.get("Error") or cod), reenviar=cod == "904")
+    return r
+
+
 def construir_func_estado(estado):
     """Constroi uma func(bulb) que aplica um estado salvo (modo/brilho/temp/cor)."""
     modo = estado.get("modo", "white")
@@ -343,30 +386,54 @@ def construir_func_estado(estado):
         eh_branco, ajust = cor_exibivel(tuple(cor))
         if eh_branco:
             def aplicar(b):
-                b.set_mode("white")
-                b.set_brightness_percentage(brilho)
+                checar_resposta(b.set_mode("white"))
+                checar_resposta(b.set_brightness_percentage(brilho))
             return aplicar
 
         def aplicar(b):
             r, g, bl = (c / 255.0 for c in ajust)
             h, s, _ = colorsys.rgb_to_hsv(r, g, bl)
-            b.set_hsv(h, s, max(0.05, brilho / 100.0))
+            checar_resposta(b.set_hsv(h, s, max(0.05, brilho / 100.0)))
         return aplicar
 
     temp = int(estado.get("temp", 50))
 
     def aplicar(b):
-        b.set_colourtemp_percentage(temp)
-        b.set_brightness_percentage(brilho)
+        checar_resposta(b.set_colourtemp_percentage(temp))
+        checar_resposta(b.set_brightness_percentage(brilho))
     return aplicar
+
+
+class _BulbAtual:
+    """O que as cenas em movimento recebem no lugar do BulbDevice: repassa cada quadro
+    para a conexao ATUAL do controlador. Antes a cena guardava o objeto do momento em
+    que comecou; quando a worker recriava a conexao (lampada caiu e voltou, IP mudou),
+    a cena seguia falando pelo objeto velho -- uma 2a conexao, presa no IP antigo."""
+
+    def __init__(self, ctrl):
+        self._ctrl = ctrl
+
+    def set_hsv(self, *args, **kwargs):
+        c = self._ctrl
+        if c.bulb is None:
+            c._conectar()
+        return c.bulb.set_hsv(*args, **kwargs)
 
 
 class Controlador:
     """Acesso serializado a lampada via uma unica thread de trabalho."""
 
-    # serializa a redescoberta de IP entre as varias lampadas: o find_device faz
-    # broadcast UDP e da bind nas portas Tuya -- duas buscas ao mesmo tempo colidem.
+    # serializa quem usa as portas UDP da Tuya (a busca em segundo plano e o botao
+    # "buscar" da janela de lampadas): duas buscas ao mesmo tempo colidem no bind.
     _scan_lock = threading.Lock()
+    # Redescoberta de IP: UMA thread e UM scan por vez, compartilhados por todas as
+    # lampadas. Antes cada lampada offline abria a propria thread a cada 15s, todas
+    # esperando o mesmo lock por scans de 18s -- entravam mais do que saiam, e depois
+    # de uns dias offline o app acumulava milhares de threads paradas (e a lampada que
+    # voltava ainda tinha que esperar a vez dela nessa fila).
+    _busca_lock = threading.Lock()   # protege os dois campos abaixo
+    _busca_pend = {}                 # id -> Controlador esperando ser achado na LAN
+    _busca_ativa = False             # a thread de busca esta rodando?
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -376,7 +443,10 @@ class Controlador:
         self.on_conexao = None     # callback(ok: bool, msg: str)
         self.on_online = None      # callback(cid, online: bool)
         self.on_ip = None          # callback(cid, novo_ip) -- IP mudou no DHCP
-        self._ultimo_scan = 0.0    # cooldown da redescoberta de IP (monotonic)
+        self._seq = {}             # acao -> numero do pedido mais recente (ver SO_O_ULTIMO)
+        self._tipo_bulb = None     # (tipo, mapa de DPs) ja detectado; reusado ao reconectar
+        self._offline = False      # a ultima tentativa de falar com a lampada falhou?
+        self._pendente = None      # (acao, args, quando) do ultimo comando que falhou
         self._anim = None          # gerador de animacao ativo (ou None)
         self._anim_delay = 0.1     # atraso ate o proximo quadro
         self.fade = False          # transicao suave on/off
@@ -390,8 +460,14 @@ class Controlador:
         ver = float(self.cfg.get("version") or 3.3)
         b = tinytuya.BulbDevice(self.cfg["id"], self.cfg["ip"], self.cfg["key"], version=ver)
         b.set_socketPersistent(True)
-        b.set_socketTimeout(5)
+        b.set_socketTimeout(TIMEOUT_SOCKET)
         b.set_socketRetryLimit(1)
+        if self._tipo_bulb:
+            # Um BulbDevice novo nao sabe que lampada e: o 1o comando depois de cada
+            # reconexao gastava uma leitura de status extra so p/ o tinytuya redescobrir
+            # o tipo (e, com ela offline, um timeout a mais). Reaproveita o ja detectado.
+            b.set_bulb_type(*self._tipo_bulb)
+            b.tried_status = True
         self.bulb = b
 
     def _forcar_reconexao(self):
@@ -420,39 +496,51 @@ class Controlador:
         """A lampada sumiu? O IP pode ter mudado: quando ela fica um tempo desligada,
         o lease de DHCP do roteador expira e ela costuma pegar OUTRO endereco ao
         religar -- mas o dispositivos.json guarda o IP antigo, entao o app fala no
-        vazio e marca 'offline' pra sempre (reabrir nao adianta). Aqui fazemos um
-        broadcast na LAN procurando o ID desta lampada e, se ela aparecer noutro IP,
-        atualizamos e reconectamos. E a correcao 'de uma vez por todas'.
+        vazio e marca 'offline' pra sempre (reabrir nao adianta). Aqui pedimos uma
+        busca por broadcast na LAN; se a lampada aparecer, a thread de busca devolve o
+        IP pela FILA (comando "_ip") e quem reconecta e a propria worker.
 
-        O scan (~6s) roda numa daemon thread para nao bloquear a fila de comandos:
-        sem isso, comandos do usuario (ligar/desligar) ficavam presos aguardando o
-        broadcast terminar a cada 15s de cooldown."""
-        agora = time.monotonic()
-        if agora - self._ultimo_scan < 15:
-            return
-        self._ultimo_scan = agora
+        So anota o pedido (nao bloqueia a fila de comandos): a busca em si roda numa
+        unica thread compartilhada (_loop_busca), que atende todas as lampadas juntas."""
         cid = self.cfg.get("id")
         if not cid:
             return
-        threading.Thread(target=self._scan_ip_bg, args=(cid,), daemon=True).start()
-
-    def _scan_ip_bg(self, cid):
-        """Roda numa daemon thread (chamada por _redescobrir_ip). Faz o broadcast
-        UDP sem bloquear a worker; atualiza cfg e forca reconexao se o IP mudou."""
+        cls = Controlador
+        with cls._busca_lock:
+            cls._busca_pend[cid] = self
+            if cls._busca_ativa:
+                return
+            cls._busca_ativa = True
         try:
-            with Controlador._scan_lock:
-                info = tinytuya.find_device(dev_id=cid)
+            threading.Thread(target=cls._loop_busca, daemon=True).start()
         except Exception:
-            return
-        novo_ip = (info or {}).get("ip")
-        if novo_ip and novo_ip != self.cfg.get("ip"):
-            self.cfg["ip"] = novo_ip      # cfg e o MESMO dict de App.lampadas
-            self._forcar_reconexao()      # proximo comando conecta no IP novo
-            if self.on_ip:
-                try:
-                    self.on_ip(cid, novo_ip)   # UI persiste no dispositivos.json
-                except Exception:
-                    pass
+            with cls._busca_lock:
+                cls._busca_ativa = False
+
+    @classmethod
+    def _loop_busca(cls):
+        """Thread unica de redescoberta. Enquanto houver lampada pedindo, faz scans
+        curtos procurando TODAS de uma vez (o scan termina antes se achar todas) e
+        avisa cada worker pela fila. Sem pedidos pendentes, a thread encerra."""
+        while True:
+            with cls._busca_lock:
+                alvos = dict(cls._busca_pend)
+                cls._busca_pend.clear()
+                if not alvos:
+                    cls._busca_ativa = False
+                    return
+            achados = {}
+            try:
+                with cls._scan_lock:
+                    achados = tuya_scanner.devices(
+                        verbose=False, poll=False, byID=True,
+                        scantime=SCAN_SEG, wantids=list(alvos)) or {}
+            except Exception:
+                time.sleep(SCAN_SEG)   # porta UDP ocupada etc.: nao vira loop apertado
+            for cid, ctrl in alvos.items():
+                ip = (achados.get(cid) or {}).get("ip")
+                if ip:
+                    ctrl.fila.put(("_ip", ip, 0))
 
     def _drenar(self):
         """Descarta respostas antigas no buffer do socket (ecos de comandos enviados
@@ -496,7 +584,7 @@ class Controlador:
         while True:
             timeout = self._anim_delay if self._anim is not None else None
             try:
-                acao, args = self.fila.get(timeout=timeout)
+                acao, args, seq = self.fila.get(timeout=timeout)
             except queue.Empty:
                 # nenhum comando pendente: avanca um quadro da animacao
                 try:
@@ -506,98 +594,160 @@ class Controlador:
                 continue
 
             if acao == "_sair":
+                self._forcar_reconexao()   # fecha o socket ja, sem esperar o coletor de lixo
                 break
+            if seq and seq != self._seq.get(acao):
+                continue   # ja existe um pedido mais novo do mesmo tipo na fila: pula este
+            try:
+                self._processar(acao, args)
+            except Exception:
+                # nunca deixa a worker morrer: sem ela a lampada fica sem controle ate
+                # reabrir o app (ex.: callback da UI falhando enquanto a janela fecha)
+                pass
 
-            if acao == "anim":
-                self._anim = None
-                if args is None:
-                    # parar a cena sem restaurar (vai aplicar outra coisa em seguida,
-                    # ou estamos so saindo): descarta o estado salvo
-                    self._snapshot = None
-                elif args == "restaurar":
-                    # parar a cena e voltar ao estado de antes dela
-                    if self._snapshot is not None:
-                        try:
-                            self._restaurar_estado(self._snapshot)
-                        except Exception as e:
-                            if self.on_conexao:
-                                self.on_conexao(False, f"erro: {e}")
-                        self._snapshot = None
-                else:
-                    # iniciar cena (args = fabrica(bulb) -> gerador). Antes de comecar,
-                    # guarda o estado atual (so na 1a cena: trocar de cena preserva o
-                    # snapshot original) para poder voltar a ele depois.
+    def _processar(self, acao, args):
+        if acao == "_ip":
+            # a busca na LAN achou a lampada (args = IP em que ela respondeu)
+            if args != self.cfg.get("ip"):
+                self.cfg["ip"] = args      # cfg e o MESMO dict de App.lampadas
+                self._forcar_reconexao()   # proximo comando conecta no IP novo
+                if self.on_ip:
+                    self.on_ip(self.cfg.get("id"), args)   # UI persiste no dispositivos.json
+            acao, args = "status", None    # ela esta na rede: confere ja, sem esperar o poll
+
+        if acao == "anim":
+            self._anim = None
+            if args is None:
+                # parar a cena sem restaurar (vai aplicar outra coisa em seguida,
+                # ou estamos so saindo): descarta o estado salvo
+                self._snapshot = None
+            elif args == "restaurar":
+                # parar a cena e voltar ao estado de antes dela
+                if self._snapshot is not None:
                     try:
-                        if self.bulb is None:
-                            self._conectar()
-                        if self._snapshot is None:
-                            self._snapshot = self._capturar_estado()
-                        self.bulb.turn_on()
-                        self._anim = args(self.bulb)
-                        self._anim_delay = 0.05
+                        self._restaurar_estado(self._snapshot)
                     except Exception as e:
                         if self.on_conexao:
                             self.on_conexao(False, f"erro: {e}")
-                continue
+                    self._snapshot = None
+            else:
+                # iniciar cena (args = fabrica(bulb) -> gerador). Antes de comecar,
+                # guarda o estado atual (so na 1a cena: trocar de cena preserva o
+                # snapshot original) para poder voltar a ele depois.
+                try:
+                    if self.bulb is None:
+                        self._conectar()
+                    if self._snapshot is None:
+                        self._snapshot = self._capturar_estado()
+                    self.bulb.turn_on()
+                    self._anim = args(_BulbAtual(self))
+                    self._anim_delay = 0.05
+                except Exception as e:
+                    if self.on_conexao:
+                        self.on_conexao(False, f"erro: {e}")
+            return
 
-            # qualquer comando manual (menos a leitura de status) interrompe a cena.
-            # O usuario assumiu o controle: descarta o estado salvo da cena.
-            if acao != "status":
-                self._anim = None
-                self._snapshot = None
+        # qualquer comando manual (menos a leitura de status) interrompe a cena.
+        # O usuario assumiu o controle: descarta o estado salvo da cena.
+        if acao != "status":
+            self._anim = None
+            self._snapshot = None
+        try:
             try:
                 self._executar(acao, args)
-            except Exception as e:
-                if self.on_conexao:
-                    self.on_conexao(False, f"erro: {e}")
-                self._notify_online(False)
-                # descarta o socket morto; o proximo comando reconecta do zero
+            except FalhaLampada as e:
+                if not e.reenviar:
+                    raise
+                # a lampada tinha fechado a conexao (socket velho): refaz e reenvia ja
                 self._forcar_reconexao()
-                self._redescobrir_ip()   # ou o IP mudou no DHCP -- procura na LAN
+                self._executar(acao, args)
+            if acao != "status":
+                self._pendente = None   # este comando entrou: nada antigo p/ reenviar
+        except Exception as e:
+            self._offline = True
+            if acao not in ("status", "cor_direto"):
+                # guarda p/ reenviar se a lampada voltar logo (ver _retomar_pendente)
+                self._pendente = (acao, args, time.monotonic())
+            if self.on_conexao:
+                self.on_conexao(False, f"erro: {e}")
+            self._notify_online(False)
+            # descarta o socket morto; o proximo comando reconecta do zero
+            self._forcar_reconexao()
+            self._redescobrir_ip()   # ou o IP mudou no DHCP -- procura na LAN
+
+    def _ler_status(self):
+        """Le o estado da lampada e repassa p/ a UI. Devolve True se ela respondeu."""
+        if self.bulb is None:
+            self._conectar()
+        b = self.bulb
+        self._drenar()
+        resp = b.status()
+        dps = resp.get("dps") if isinstance(resp, dict) else None
+        if not dps:
+            return False
+        self._offline = False
+        if self._tipo_bulb is None and b.bulb_configured:
+            self._tipo_bulb = (b.bulb_type, dict(b.dpset))
+        self._sincronizar_ultimos(dps)
+        self._notify_status(dps)
+        self._notify_online(True)
+        return True
+
+    def _retomar_pendente(self):
+        """A lampada respondeu: se um comando falhou ha pouco (clicado enquanto ela
+        ainda estava voltando p/ a rede), executa agora. Era o 'cliquei e nao aconteceu
+        nada' -- o comando morria no timeout e ninguem tentava de novo."""
+        p, self._pendente = self._pendente, None
+        if not p or time.monotonic() - p[2] > RETOMAR_CMD_SEG:
+            return
+        self._executar(p[0], p[1])
+        self.pedir_status()   # mostra na UI o estado ja com o comando aplicado
 
     def _executar(self, acao, args):
-        b = self.bulb
-        if b is None:
-            self._conectar()
-            b = self.bulb
         if acao == "status":
-            self._drenar()
-            resp = b.status()
-            dps = resp.get("dps") if isinstance(resp, dict) else None
-            if dps:
-                self._sincronizar_ultimos(dps)
-                self._notify_status(dps)
-                self._notify_online(True)
+            if self._ler_status():
+                self._retomar_pendente()
             else:
                 # respondeu sem dados / com erro -> tratamos como indisponivel.
                 # forca reconexao: senao o socket persistente fica preso num estado
                 # morto e nunca volta, mesmo depois que a lampada religa.
+                self._offline = True
                 self._notify_online(False)
                 self._forcar_reconexao()
                 self._redescobrir_ip()   # ou o IP mudou no DHCP -- procura na LAN
-        elif acao == "power":
-            b.turn_on() if args else b.turn_off()
+            return
+        if self._offline and not self._ler_status():
+            # lampada sem resposta: UMA leitura decide. Sem isto, cada passo interno do
+            # comando (e cada degrau do fade) tentava conectar e esperava o proprio
+            # timeout -- com a transicao suave ligada eram ~30s de fila parada.
+            raise FalhaLampada("sem resposta")
+        b = self.bulb
+        if b is None:
+            self._conectar()
+            b = self.bulb
+        if acao == "power":
+            checar_resposta(b.turn_on() if args else b.turn_off())
         elif acao == "brilho":
             self._aplicar_num(b.set_brightness_percentage, self._lb, args, "_lb")
         elif acao == "brilho_direto":
             v = max(1, min(100, int(args)))
-            b.set_brightness_percentage(v)
+            checar_resposta(b.set_brightness_percentage(v))
             self._lb = v
         elif acao == "temp":
             self._aplicar_num(b.set_colourtemp_percentage, self._lt, args, "_lt")
         elif acao == "branco":
-            b.set_mode("white")
+            checar_resposta(b.set_mode("white"))
         elif acao == "cor":
             self._aplicar_cor_fade(b, args)
         elif acao == "cor_direto":
             r, g, bl = (int(c) for c in args)
-            b.set_colour(r, g, bl)
+            checar_resposta(b.set_colour(r, g, bl))
             self._lc = (r, g, bl)
         elif acao == "hsv":
             # aplica H/S/V direto (anel + sliders de cor): respeita a saturacao
             # escolhida, sem o ajuste cor_exibivel (que e so p/ presets em RGB).
             h, s, v = args
-            b.set_hsv(h, s, max(0.05, v))
+            checar_resposta(b.set_hsv(h, s, max(0.05, v)))
             r, g, bl = colorsys.hsv_to_rgb(h, s, v)
             self._lc = (int(r * 255), int(g * 255), int(bl * 255))
         elif acao == "func":
@@ -620,11 +770,14 @@ class Controlador:
             passos = _passos(atual, alvo)
             for i, v in enumerate(passos):
                 ultimo = (i == len(passos) - 1)
-                fn(max(1, min(100, v)), nowait=not ultimo)
+                # checa cada degrau: se a conexao caiu, para no 1o em vez de gastar
+                # um timeout por degrau
+                checar_resposta(fn(max(1, min(100, v)), nowait=not ultimo),
+                                sem_espera=not ultimo)
                 if not ultimo:
                     time.sleep(0.05)
         else:
-            fn(alvo)
+            checar_resposta(fn(alvo))
         setattr(self, attr, alvo)
 
     def _aplicar_cor_fade(self, b, rgb):
@@ -636,11 +789,12 @@ class Controlador:
                 rr = round(lr + (r - lr) * k / n)
                 gg = round(lg + (g - lg) * k / n)
                 bb = round(lb + (bl - lb) * k / n)
-                b.set_colour(rr, gg, bb, nowait=(k < n))
+                checar_resposta(b.set_colour(rr, gg, bb, nowait=(k < n)),
+                                sem_espera=(k < n))
                 if k < n:
                     time.sleep(0.05)
         else:
-            b.set_colour(r, g, bl)
+            checar_resposta(b.set_colour(r, g, bl))
         self._lc = (r, g, bl)
 
     def _capturar_estado(self):
@@ -686,46 +840,55 @@ class Controlador:
                 self._lb = pct
 
     # --- API publica (enfileira) ---
+    def _enfileirar(self, acao, args=None):
+        # itens da fila sao (acao, args, seq). seq != 0 marca os comandos em que so o
+        # ultimo interessa: a worker pula o item se ja houver outro mais novo na fila.
+        seq = 0
+        if acao in SO_O_ULTIMO:
+            seq = self._seq.get(acao, 0) + 1
+            self._seq[acao] = seq
+        self.fila.put((acao, args, seq))
+
     def pedir_status(self):
-        self.fila.put(("status", None))
+        self._enfileirar("status", None)
 
     def iniciar_cena(self, gerador):
-        self.fila.put(("anim", gerador))
+        self._enfileirar("anim", gerador)
 
     def parar_cena(self, restaurar=True):
         # restaurar=True: volta ao estado de antes da cena. False: so para.
-        self.fila.put(("anim", "restaurar" if restaurar else None))
+        self._enfileirar("anim", "restaurar" if restaurar else None)
 
     def aplicar_func(self, func):
-        self.fila.put(("anim", None))
-        self.fila.put(("func", func))
+        self._enfileirar("anim", None)
+        self._enfileirar("func", func)
 
     def power(self, ligado):
-        self.fila.put(("power", ligado))
+        self._enfileirar("power", ligado)
 
     def brilho(self, pct):
-        self.fila.put(("brilho", pct))
+        self._enfileirar("brilho", pct)
 
     def brilho_direto(self, pct):
-        self.fila.put(("brilho_direto", pct))
+        self._enfileirar("brilho_direto", pct)
 
     def temperatura(self, pct):
-        self.fila.put(("temp", pct))
+        self._enfileirar("temp", pct)
 
     def modo_branco(self):
-        self.fila.put(("branco", None))
+        self._enfileirar("branco", None)
 
     def cor(self, rgb):
-        self.fila.put(("cor", rgb))
+        self._enfileirar("cor", rgb)
 
     def cor_direto(self, rgb):
-        self.fila.put(("cor_direto", rgb))
+        self._enfileirar("cor_direto", rgb)
 
     def cor_hsv(self, h, s, v):
-        self.fila.put(("hsv", (h, s, v)))
+        self._enfileirar("hsv", (h, s, v))
 
     def encerrar(self):
-        self.fila.put(("_sair", None))
+        self._enfileirar("_sair", None)
 
 
 # =================== widgets customizados (visual moderno) ===================
@@ -1507,27 +1670,46 @@ class App(tk.Tk):
         self._atualizar_swatch_branco()
 
     # ---------- helpers de estado visual ----------
-    def _marcar_acao(self):
+    def _marcar_acao(self, intencao=False):
         """Apos uma acao do usuario, ignora o poll por alguns segundos para a
-        leitura periodica nao 'voltar' o menu/sliders ao estado anterior."""
+        leitura periodica nao 'voltar' o menu/sliders ao estado anterior.
+
+        intencao=True tambem anota o estado da UI como "o que o PC mandou" (base da
+        reafirmacao em _aplicar_status). SO passar True DEPOIS de atualizar as
+        variaveis da UI (var_modo/var_brilho/var_temp/var_sat): chamado antes, anotava
+        o estado ANTIGO e o poll seguinte desfazia a acao (favorito/cena fixa/padrao
+        voltavam sozinhos em segundos). Sem intencao (power, cena em movimento, modo
+        ambiente), a anotacao anterior e apagada -- nesses casos nao ha o que reafirmar.
+
+        intencao="modo": so a troca para branco foi comandada (botao Branco / cor
+        pastel). Brilho e temperatura ficam None = "os que a lampada ja tinha", pra a
+        reafirmacao nao empurrar os valores dos sliders por cima deles."""
         self._mute_ate = time.monotonic() + 3.0
-        modo = self.var_modo.get()
-        brilho = int(self.var_brilho.get())
-        if modo == "colour":
-            h = self._cor_h
-            s = max(0.0, min(1.0, int(self.var_sat.get()) / 100.0))
-            v = max(0.01, min(1.0, brilho / 100.0))
-            cor = tuple(int(c * 255) for c in colorsys.hsv_to_rgb(h, s, v))
-        else:
-            cor = None
+        if not intencao:
+            self._intencao_cmd = None
+            return
+        so_modo = intencao == "modo"
         self._intencao_cmd = {
             "ts": time.monotonic(),
-            "modo": modo,
-            "brilho": brilho,
-            "temp": int(self.var_temp.get()),
+            "modo": self.var_modo.get(),
+            "brilho": None if so_modo else int(self.var_brilho.get()),
+            "temp": None if so_modo else int(self.var_temp.get()),
             "sat": int(self.var_sat.get()),
-            "cor": cor,
+            "h": self._cor_h,
         }
+
+    def _reafirmar_intencao(self):
+        """Reenvia a lampada selecionada o estado anotado em _marcar_acao, pelos
+        mesmos comandos que a UI usa (em cor, H/S/V exatos -- sem o ajuste de
+        cor_exibivel, que mudaria a saturacao e geraria outro 'conflito')."""
+        it = self._intencao_cmd
+        if it["modo"] == "colour":
+            self.ctrl.cor_hsv(it["h"], it["sat"] / 100.0, max(0.01, it["brilho"] / 100.0))
+        elif it["brilho"] is None:
+            self.ctrl.modo_branco()
+        else:
+            self.ctrl.aplicar_func(construir_func_estado(
+                {"modo": "white", "temp": it["temp"], "brilho": it["brilho"]}))
 
     def _conflito_detectado(self, dps):
         """Retorna True se os DPS recebidos divergem do estado intencionado pelo PC."""
@@ -1539,16 +1721,18 @@ class App(tk.Tk):
             if (dps[DP_MODE] == "colour") != (modo == "colour"):
                 return True
         if modo == "white":
-            if DP_BRIGHT in dps:
+            if DP_BRIGHT in dps and intent["brilho"] is not None:
                 if abs(brilho_para_pct(dps[DP_BRIGHT]) - intent["brilho"]) > 2:
                     return True
-            if DP_TEMP in dps:
+            if DP_TEMP in dps and intent["temp"] is not None:
                 pct = round(int(dps[DP_TEMP]) / 1000 * 100)
                 if abs(pct - intent["temp"]) > 2:
                     return True
         elif modo == "colour" and dps.get(DP_COLOUR):
             _, s, v = parse_hsv_componentes(dps[DP_COLOUR])
-            if abs(round(v * 100) - intent["brilho"]) > 2:
+            # em cor a lampada nao desce de 5% (set_hsv usa max(0.05, v)): pedir 1%
+            # e ler 5% de volta nao e conflito
+            if abs(round(v * 100) - max(5, intent["brilho"])) > 2:
                 return True
             if abs(round(s * 100) - intent["sat"]) > 2:
                 return True
@@ -1609,6 +1793,8 @@ class App(tk.Tk):
         self.var_power.set(novo)
         self._refletir_power(novo)
         self.ctrl.power(novo)
+        if novo:
+            self._dn_ultimo_alvo = None   # a rampa noturna pulou esta lampada apagada: reenvia
 
     def _selecionar_modo(self, modo, enviar=True):
         self.var_modo.set(modo)
@@ -1617,7 +1803,7 @@ class App(tk.Tk):
         if not enviar or self._sincronizando:
             return
         if modo == "white":
-            self._marcar_acao()
+            self._marcar_acao(intencao="modo")
             self._refletir_ligada()
             self._limpar_cena_ativa()
             self.ctrl.modo_branco()
@@ -1633,7 +1819,7 @@ class App(tk.Tk):
         if self.var_modo.get() == "colour":
             self._cor_mudou()        # em cor, o brilho e o V (valor) do HSV
             return
-        self._marcar_acao()
+        self._marcar_acao(intencao=True)
         self._refletir_ligada()
         self._limpar_cena_ativa()
         self._atualizar_swatch_branco()
@@ -1644,7 +1830,7 @@ class App(tk.Tk):
     def _temp_mudou(self, _=None):
         if self._sincronizando:
             return
-        self._marcar_acao()
+        self._marcar_acao(intencao=True)
         self._refletir_ligada()
         self._limpar_cena_ativa()
         pct = int(float(self.var_temp.get()))
@@ -1671,7 +1857,7 @@ class App(tk.Tk):
     def _cor_mudou(self):
         """Aplica a cor atual (matiz do anel + saturacao + brilho dos sliders) na
         lampada selecionada, com debounce. Atualiza o swatch e o centro do anel."""
-        self._marcar_acao()
+        self._marcar_acao(intencao=True)
         self._refletir_ligada()
         self._limpar_cena_ativa()
         h = self._cor_h
@@ -1703,6 +1889,7 @@ class App(tk.Tk):
             self.var_modo.set("white")
             self._set_modo_ui("white")
             self._atualizar_visibilidade_modo()
+            self._marcar_acao(intencao="modo")   # agora sim a UI ja mostra "branco"
             self.ctrl.modo_branco()
             self._atualizar_swatch_branco()
             self._status(T("status_cor_muito_clara"), MUTED)
@@ -1802,7 +1989,6 @@ class App(tk.Tk):
         return []
 
     def _cena_fixa(self, nome, temp, brilho):
-        self._marcar_acao()
         self._sincronizando = True
         try:
             self.var_modo.set("white")
@@ -1817,6 +2003,7 @@ class App(tk.Tk):
             self._atualizar_visibilidade_modo()
         finally:
             self._sincronizando = False
+        self._marcar_acao(intencao=True)   # depois de a UI ja mostrar a cena
         func = construir_func_estado({"modo": "white", "temp": temp, "brilho": brilho})
         alvos = self._alvos_cena()
         for _, c in alvos:
@@ -1884,7 +2071,6 @@ class App(tk.Tk):
     def _aplicar_estado(self, est, msg=None, todas=False):
         """Reflete um estado salvo (padrao/favorito) na UI e aplica na lampada.
         Com todas=True aplica em todas as lampadas (usado pelo dia/noite)."""
-        self._marcar_acao()
         self._limpar_cena_ativa()
         self._sincronizando = True
         try:
@@ -1893,9 +2079,15 @@ class App(tk.Tk):
             self._set_modo_ui(modo)
             self.var_brilho.set(int(est.get("brilho", 100)))
             self.lbl_brilho.config(text=T("lbl_brilho", pct=int(est.get('brilho', 100))))
+            # em cor "pastel" a lampada vai p/ branco (ver construir_func_estado): ali a
+            # UI nao bate com o que foi enviado, entao nao ha intencao a reafirmar
+            intencao = modo != "colour"
             if modo == "colour" and est.get("cor"):
-                # alimenta o estado HSV (anel + saturacao) a partir da cor salva
-                r, g, b = (c / 255.0 for c in est["cor"])
+                # alimenta o estado HSV (anel + saturacao) a partir da cor salva, ja
+                # com o ajuste de cor_exibivel -- a saturacao que a lampada recebe
+                eh_branco, ajust = cor_exibivel(tuple(est["cor"]))
+                intencao = not eh_branco
+                r, g, b = (c / 255.0 for c in ajust)
                 h, s, _v = colorsys.rgb_to_hsv(r, g, b)
                 self._cor_h = h
                 self.var_sat.set(round(s * 100))
@@ -1914,6 +2106,7 @@ class App(tk.Tk):
             self._atualizar_visibilidade_modo()
         finally:
             self._sincronizando = False
+        self._marcar_acao(intencao=intencao)   # depois de a UI ja mostrar o estado novo
         func = construir_func_estado(est)
         if todas:
             for c in self.controladores:
@@ -2184,7 +2377,9 @@ class App(tk.Tk):
         # e' a lampada-alvo fixada no inicio (nao le self.ctrl, que pode mudar de aba)
         while self._ambiente_ativo and gen == self._ambiente_gen:
             try:
-                px = list(ImageGrab.grab().resize((48, 27)).getdata())
+                # BOX = media simples de cada bloco: e o que se quer p/ "cor dominante"
+                # e ~4x mais rapido aqui que o filtro padrao (bicubico)
+                px = list(ImageGrab.grab().resize((48, 27), Image.BOX).getdata())
                 # media circular do matiz ponderada por saturacao*valor:
                 # pixels vivos dominam; branco/cinza/UI quase nao contam
                 sx = sy = wsum = vsum = 0.0
@@ -2278,13 +2473,25 @@ class App(tk.Tk):
         # so envia quando o ALVO calculado muda (nao reage ao arredondamento do poll)
         if alvo != self._dn_ultimo_alvo:
             self._dn_ultimo_alvo = alvo
-            self._marcar_acao()
-            self.var_brilho.set(alvo)
-            self.lbl_brilho.config(text=T("lbl_brilho", pct=alvo))
-            if self.var_modo.get() == "white":
-                self._atualizar_swatch_branco()
             for c in self.controladores:        # rampa noturna em todas as lampadas
+                if self._esta_apagada(c):
+                    # mudar o brilho ACENDE a lampada (a Tuya liga ao receber o comando):
+                    # sem pular, a rampa religava sozinha quem foi apagado pelo app
+                    continue
+                if c is self.ctrl:
+                    self.var_brilho.set(alvo)
+                    self.lbl_brilho.config(text=T("lbl_brilho", pct=alvo))
+                    if self.var_modo.get() == "white":
+                        self._atualizar_swatch_branco()
+                    self._marcar_acao(intencao=True)
                 c.brilho_direto(alvo)            # direto, sem fade (a rampa ja e gradual)
+
+    def _esta_apagada(self, ctrl):
+        """True quando sabemos que a lampada esta desligada pelo app (nao pela parede):
+        a selecionada pelo botao de power, as outras pelo ultimo status lido."""
+        if ctrl is self.ctrl:
+            return not self.var_power.get()
+        return (self._cache_status.get(ctrl.cfg.get("id")) or {}).get(DP_POWER) is False
 
     def _dn_atualizar_label(self):
         cfg = self.prefs.get("dia_noite") or {}
@@ -2301,7 +2508,9 @@ class App(tk.Tk):
 
     # ---------- callbacks do controlador (rodam na thread worker) ----------
     def _status_recebido(self, cid, dps):
-        self._cache_status[cid] = dps   # guarda p/ exibir imediatamente ao trocar de aba
+        # guarda p/ exibir imediatamente ao trocar de aba. Mescla com o anterior: durante
+        # uma cena a leitura pode trazer so parte dos DPs (eco de um quadro)
+        self._cache_status[cid] = {**self._cache_status.get(cid, {}), **dps}
         self.after(0, lambda: self._aplicar_status(cid, dps))
 
     def _conexao_mudou(self, ok, msg):
@@ -2402,12 +2611,13 @@ class App(tk.Tk):
         for c in self.controladores:
             c.pedir_status()
         # Poll mais rapido quando ha lampada offline: a lampada pode ter voltado
-        # entre um poll e outro; 5s casa com o socket timeout (nao adianta ir abaixo).
+        # entre um poll e outro. Casa com TIMEOUT_SOCKET (cada tentativa numa lampada
+        # desligada dura um timeout inteiro; pedidos repetidos sao pulados na fila).
         alguma_offline = any(
             self._online_lamp.get(l.get("id")) is False
             for l in self.lampadas
         )
-        self.after(5000 if alguma_offline else 7000, self._poll_status)
+        self.after(TIMEOUT_SOCKET * 1000 if alguma_offline else 7000, self._poll_status)
 
     def _aplicar_status(self, cid, dps):
         if cid != self._id_ativo():
@@ -2418,11 +2628,13 @@ class App(tk.Tk):
         # Reafirmacao de intencao: se o poll trouxe um valor diferente do que o PC
         # comandou nos ultimos 15s (conflito com a nuvem Tuya), reenvia o comando
         # do PC em vez de aceitar o estado externo.
+        # (lampada apagada fica de fora: reafirmar brilho/cor a acenderia sozinha)
         if (self._intencao_cmd is not None
                 and agora - self._intencao_cmd["ts"] < 15.0
+                and dps.get(DP_POWER, True)
                 and self._conflito_detectado(dps)):
             self._mute_ate = agora + 3.0
-            self.ctrl.aplicar_func(construir_func_estado(self._intencao_cmd))
+            self._reafirmar_intencao()
             return
         if self._intencao_cmd and agora - self._intencao_cmd["ts"] >= 15.0:
             self._intencao_cmd = None
@@ -2709,7 +2921,10 @@ class ConfigWindow(tk.Toplevel):
 
         def trabalho():
             try:
-                achados = tinytuya.deviceScan(False, 12)
+                # mesmo lock da redescoberta de IP: as duas buscas usam as mesmas
+                # portas UDP, e juntas uma delas falhava no bind (achava "nada")
+                with Controlador._scan_lock:
+                    achados = tinytuya.deviceScan(False, 12)
             except Exception:
                 achados = {}
             self.after(0, lambda: self._buscar_concluido(achados))

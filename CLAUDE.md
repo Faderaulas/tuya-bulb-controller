@@ -36,7 +36,7 @@ python -m venv .venv
   --add-data "icon.png;." --add-data "icon.ico;." controlador_lampada.py
 ```
 
-Não há testes nem lint — é um único script (`controlador_lampada.py`, ~2200 linhas) mais
+Não há testes nem lint — é um único script (`controlador_lampada.py`, ~3200 linhas) mais
 `i18n.py` e utilitários. O `.exe` oficial é montado pelo **GitHub Actions**
 (`.github/workflows/release.yml`) ao dar push numa tag `v*`, com atestado de proveniência
 assinado. O `i18n.py` é importado estaticamente, então o PyInstaller o empacota sozinho
@@ -59,6 +59,21 @@ Toda a aplicação está em `controlador_lampada.py`. As peças que exigem ler v
   mantenha esse contrato: nada de chamadas tinytuya fora da worker. **`on_status`/`on_online`
   carregam o `id` da lâmpada emissora** (1º argumento): a UI roteia por esse id para não pintar o
   estado de uma lâmpada nos controles de outra durante uma troca de aba (corrida do `after`).
+  Itens da fila são `(acao, args, seq)`: para os tipos em `SO_O_ULTIMO` (`status`, `brilho`, `temp`,
+  `cor`, `cor_direto`, `hsv`...) a worker **pula o item se já houver outro mais novo do mesmo tipo**
+  — sem isso o modo ambiente (1 quadro/0,3s) e os polls acumulavam na fila atrás de uma lâmpada
+  lenta/offline e o clique do usuário esperava a fila inteira.
+
+- **Falha de comando (gotcha do tinytuya).** O tinytuya **não levanta exceção** quando a lâmpada
+  não responde: devolve `{"Error":..., "Err": código}`. Todo comando passa por `checar_resposta()`,
+  que transforma erro de conexão (`ERROS_DE_CONEXAO`) em `FalhaLampada`. A worker então marca
+  `_offline`, reconecta e guarda o comando em `_pendente`; se a lâmpada responder em até
+  `RETOMAR_CMD_SEG` (15s), `_retomar_pendente()` o reenvia (o "cliquei e não aconteceu nada"
+  enquanto ela voltava pra rede). Com `_offline` ligado, cada comando começa por **uma** leitura de
+  status: sem isso cada passo interno (e cada degrau do fade) gastava o próprio timeout. O tipo da
+  lâmpada detectado (`_tipo_bulb`) é reaplicado a cada `_conectar()` para o tinytuya não gastar
+  uma leitura extra redescobrindo-o. `TIMEOUT_SOCKET` (3s) vale para conectar e para esperar
+  resposta — um IP morto só "falha" no timeout cheio, e nesse tempo a fila daquela lâmpada para.
 
 - **Estado por lâmpada (id).** Vários estados são rastreados por `id` da lâmpada, não globalmente:
   `_cenas_ativas` (cena destacada), `_online_lamp`/`_falhas_online` (online + debounce de 2 falhas
@@ -73,11 +88,17 @@ Toda a aplicação está em `controlador_lampada.py`. As peças que exigem ler v
   1. `_forcar_reconexao()` — fecha o socket e zera `self.bulb`. O socket do tinytuya é
      **persistente** (`set_socketPersistent(True)`); sem isso ele fica preso num socket morto e
      **nunca volta**, mesmo depois da lâmpada religar (reabrir o app não resolvia).
-  2. `_redescobrir_ip()` — faz `tinytuya.find_device(dev_id=...)` por broadcast na LAN (cooldown de
-     15s; `Controlador._scan_lock` serializa entre lâmpadas). Se a lâmpada aparecer **noutro IP**
-     (o DHCP costuma dar outro endereço quando ela fica um tempo desligada), atualiza `cfg["ip"]`,
-     reconecta e chama `on_ip` → `App._salvar_ip` persiste no `dispositivos.json`. É a correção do
-     "fica offline pra sempre mesmo ligada". `cfg` é o **mesmo dict** de `App.lampadas`.
+  2. `_redescobrir_ip()` — só **anota o pedido** em `Controlador._busca_pend`. Uma **única** thread
+     compartilhada (`_loop_busca`) faz scans curtos (`SCAN_SEG`, 5s) por broadcast procurando
+     **todas** as lâmpadas pendentes de uma vez e devolve o IP pela fila da worker (comando `_ip`),
+     que então lê o status na hora. Se a lâmpada aparecer **noutro IP** (o DHCP costuma dar outro
+     endereço quando ela fica um tempo desligada), a worker atualiza `cfg["ip"]`, reconecta e chama
+     `on_ip` → `App._salvar_ip` persiste no `dispositivos.json`. É a correção do "fica offline pra
+     sempre mesmo ligada". `cfg` é o **mesmo dict** de `App.lampadas`. **Não voltar a abrir uma
+     thread por lâmpada/por falha:** era assim, com scans de 18s atrás de um lock — entravam mais
+     threads do que saíam e, com lâmpadas desligadas na parede por dias, o app chegou a ~4.700
+     threads/900 MB (e a lâmpada que voltava com IP novo esperava ~40s na fila de scans).
+     `_scan_lock` serializa quem usa as portas UDP (essa busca e o "buscar" da `ConfigWindow`).
 
   Quando a lâmpada **volta** online, `_ao_ligar_lampada` aplica o perfil dia/noite (se ativo) ou o
   estado padrão (se `aplicar_ao_abrir`). O padrão **não** é aplicado na abertura do app — só nessa
@@ -95,7 +116,9 @@ Toda a aplicação está em `controlador_lampada.py`. As peças que exigem ler v
 - **Cenas em movimento** são geradores Python (`cena_arcoiris`/`cena_vela`/`cena_respirar`/
   `cena_sensual`/`cena_aurora`/`cena_festa`) que dão `yield` no delay até o próximo quadro. A
   worker, quando a fila está vazia, usa esse delay como timeout do `queue.get` e avança um quadro
-  por vez. Qualquer comando manual (exceto `status`) cancela a cena. Todas têm a assinatura
+  por vez. Qualquer comando manual (exceto `status`) cancela a cena. O `b` que a cena recebe é um
+  `_BulbAtual` (repassa `set_hsv` para a conexão atual do controlador, que pode ser recriada no
+  meio da cena), não o `BulbDevice` em si. Todas têm a assinatura
   `(b, fase0=0.0, escala_v=1.0)`: `fase0` defasa cada lâmpada quando rodam em **grupo**; `escala_v`
   enfraquece a lâmpada (ex.: teto, via `escala_brilho_cfg`).
 
@@ -114,7 +137,18 @@ Toda a aplicação está em `controlador_lampada.py`. As peças que exigem ler v
   comandos enquanto a UI é atualizada a partir do status. Sliders usam debounce
   (`_debounce_brilho`/`_debounce_temp`, ~220ms). Há zonas mortas de 1% para absorver o jitter de
   arredondamento do round-trip. Mexer num desses sem entender os outros costuma criar loops de
-  feedback (UI piscando / valores revertendo).
+  feedback (UI piscando / valores revertendo). O poll cai para `TIMEOUT_SOCKET` (3s) enquanto
+  houver lâmpada offline.
+
+- **Reafirmação de intenção (vs. nuvem Tuya).** `_marcar_acao(intencao=True)` anota o estado da UI
+  em `_intencao_cmd`; se nos 15s seguintes o poll ler outra coisa (o app Izy Smart sobrescreveu
+  pela nuvem), `_aplicar_status` reenvia via `_reafirmar_intencao()`. **Só passar `intencao=True`
+  DEPOIS de atualizar as variáveis da UI** — chamado antes, anotava o estado *antigo* e o poll
+  desfazia a própria ação (favorito, cena fixa e padrão voltavam sozinhos; cena em movimento era
+  cancelada). `intencao="modo"` = só a troca para branco foi comandada (brilho/temp ficam `None`).
+  Sem intenção (power, cena em movimento, modo ambiente) a anotação é apagada. Lâmpada apagada
+  nunca é reafirmada (reenviar brilho/cor a acenderia). Pelo mesmo motivo a rampa noturna
+  (`_dn_rampa`) pula lâmpadas apagadas (`_esta_apagada`).
 
 - **Color handling.** A lâmpada não mostra pastel/branco em modo cor: `cor_exibivel()` empurra
   cores quase dessaturadas para o modo "white" e reforça a saturação das demais. `parse_hsv_hex()`
