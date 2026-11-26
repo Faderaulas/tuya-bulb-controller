@@ -52,6 +52,10 @@ Histórico do que foi feito e o que está planejado. Atualizado conforme o proje
 
 > Não feito (opcional, baixa prioridade): instalador `setup.exe` (Inno Setup) — redundante com a Release.
 
+### Segurança das dependências (26/11/2026)
+- [x] **Pillow 12.2.0 → 13.0.0** (`requirements.txt`): a 12.2.0 tinha 56 avisos de vulnerabilidade, 5 deles críticos (estouros de memória ao abrir/salvar TIFF, JPEG e FPX). No `.venv` também subiram `cryptography` 50.0.2, `urllib3` 2.8.0, `certifi` 2026.10.23, `setuptools` 84.2.1 e `pip` 26.3. Tudo com a quarentena de 7 dias e só wheels. Testado: captura de tela, ícone, ImageTk, pystray, AES do tinytuya, e o `.exe` recompilado abre normal.
+- [ ] Pillow 14 (out/2027) remove `Image.getdata()`, usado no Modo Ambiente: trocar por `get_flattened_data()` antes de subir para a 14.
+
 ### Estabilidade e desempenho (11/10/2026)
 Revisão geral motivada por "a lâmpada fica ligada um bom tempo até o app conseguir alterar ela".
 Detalhes de cada mecanismo no `CLAUDE.md` (seção Arquitetura).
